@@ -1,0 +1,24 @@
+{
+  "name": "popupMaxDMC",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-amplify": "^3.1030.0",
+    "@aws-sdk/client-s3": "^3.1032.0",
+    "@aws-sdk/client-s3-control": "^3.1032.0",
+    "@aws-sdk/client-wafv2": "^3.1030.0",
+    "@aws-sdk/s3-request-presigner": "^3.1032.0",
+    "dotenv": "^17.4.2",
+    "ioredis": "^5.4.2",
+    "simple-git": "^3.36.0",
+    "uuid": "^13.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
