@@ -22,10 +22,7 @@ const OBJECT_KEY = process.env.OBJECT_KEY || "index.html";
 const BATCH_SIZE = 600;
 const TOPUP_THRESHOLD = 50; // trigger top-up when unused drops to this (≈550 used)
 const PRESIGN_EXPIRY_SECONDS = 5;
-const CREATE_CONCURRENCY = 10;
-const DELETE_CONCURRENCY = 10;
-const CREATE_RETRIES = 3;
-const TOPUP_LOCK_TTL_SECONDS = 1200;
+const TOPUP_LOCK_TTL_SECONDS = 1800;
 
 // ─── Redis keys ───────────────────────────────────────────────────
 const KEY_UNUSED = "aps:unused"; // LIST — FIFO queue of AP names
@@ -51,25 +48,6 @@ redis.on("error", (err) => console.error("Redis error:", err.message));
 
 // ─── AP pool helpers ──────────────────────────────────────────────
 
-async function parallelMap(items, concurrency, fn) {
-  const results = new Array(items.length);
-  let cursor = 0;
-  const workerCount = Math.min(concurrency, items.length);
-  const workers = Array.from({ length: workerCount }, async () => {
-    while (true) {
-      const i = cursor++;
-      if (i >= items.length) break;
-      try {
-        results[i] = { ok: true, value: await fn(items[i], i) };
-      } catch (err) {
-        results[i] = { ok: false, err };
-      }
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
-
 async function listAllAccessPoints() {
   const names = [];
   let NextToken;
@@ -88,50 +66,18 @@ async function listAllAccessPoints() {
   return names;
 }
 
-async function createAccessPoint(name) {
-  let attempt = 0;
-  while (true) {
+async function deleteManyAccessPoints(names) {
+  let failed = 0;
+  for (const name of names) {
     try {
       await s3Control.send(
-        new CreateAccessPointCommand({
-          AccountId: ACCOUNT_ID,
-          Name: name,
-          Bucket: BUCKET_NAME,
-        }),
+        new DeleteAccessPointCommand({ AccountId: ACCOUNT_ID, Name: name }),
       );
-      return;
     } catch (err) {
-      const status = err.$metadata?.httpStatusCode;
-      const retryable =
-        err.name === "ThrottlingException" ||
-        err.name === "TooManyRequestsException" ||
-        (status && status >= 500);
-      if (attempt < CREATE_RETRIES && retryable) {
-        attempt++;
-        const delay = 500 * Math.pow(2, attempt);
-        await new Promise((r) => setTimeout(r, delay));
-        continue;
-      }
-      throw err;
+      if (err.name === "NoSuchAccessPoint") continue;
+      failed++;
+      console.error(`[AP] delete failed for ${name}: ${err.name || err.message}`);
     }
-  }
-}
-
-async function deleteAccessPoint(name) {
-  try {
-    await s3Control.send(
-      new DeleteAccessPointCommand({ AccountId: ACCOUNT_ID, Name: name }),
-    );
-  } catch (err) {
-    if (err.name !== "NoSuchAccessPoint") throw err;
-  }
-}
-
-async function deleteManyAccessPoints(names) {
-  const results = await parallelMap(names, DELETE_CONCURRENCY, deleteAccessPoint);
-  const failed = results.filter((r) => !r.ok).length;
-  if (failed) {
-    console.error(`[AP] ${failed}/${names.length} deletes failed`);
   }
   return names.length - failed;
 }
@@ -195,29 +141,32 @@ async function runTopUp() {
     }
 
     const batchId = Date.now().toString();
-    console.log(`[topUp] creating batch ${batchId}: ${BATCH_SIZE} APs…`);
-
-    const names = Array.from(
-      { length: BATCH_SIZE },
-      () => `ap-${batchId}-${uuidv4().split("-")[0]}`,
-    );
+    console.log(`[topUp] creating batch ${batchId}: ${BATCH_SIZE} APs (serial)…`);
 
     const start = Date.now();
-    const results = await parallelMap(
-      names,
-      CREATE_CONCURRENCY,
-      createAccessPoint,
-    );
     const created = [];
-    const failed = [];
-    results.forEach((r, i) => {
-      if (r.ok) created.push(names[i]);
-      else failed.push({ name: names[i], err: r.err.message });
-    });
+    let failed = 0;
+
+    for (let i = 1; i <= BATCH_SIZE; i++) {
+      const name = `ap-${batchId}-${uuidv4().split("-")[0]}-${i}`;
+      try {
+        await s3Control.send(
+          new CreateAccessPointCommand({
+            AccountId: ACCOUNT_ID,
+            Name: name,
+            Bucket: BUCKET_NAME,
+          }),
+        );
+        created.push(name);
+        if (i % 50 === 0) console.log(`[topUp] progress: ${i}/${BATCH_SIZE}`);
+      } catch (err) {
+        failed++;
+        console.error(`[topUp] create failed (${name}): ${err.name || err.message}`);
+      }
+    }
 
     if (created.length === 0) {
       console.error("[topUp] all creates failed");
-      if (failed.length) console.error("  sample error:", failed[0].err);
       return;
     }
 
@@ -230,7 +179,7 @@ async function runTopUp() {
 
     const secs = ((Date.now() - start) / 1000).toFixed(1);
     console.log(
-      `[topUp] batch ${batchId}: ${created.length} live, ${failed.length} failed, ${secs}s`,
+      `[topUp] batch ${batchId}: ${created.length}/${BATCH_SIZE} live, ${failed} failed, ${secs}s`,
     );
   } catch (err) {
     console.error("[topUp] error:", err);
@@ -558,10 +507,12 @@ const server = http.createServer(async (req, res) => {
 
   if (parsed.pathname === "/status") {
     try {
-      const [unused, used, batchIds] = await Promise.all([
+      const [unused, used, batchIds, lockVal, lockTtl] = await Promise.all([
         redis.llen(KEY_UNUSED),
         redis.scard(KEY_USED),
         redis.lrange(KEY_BATCHES, 0, -1),
+        redis.get(KEY_TOPUP_LOCK),
+        redis.ttl(KEY_TOPUP_LOCK),
       ]);
       const batches = [];
       for (const id of batchIds) {
@@ -574,12 +525,68 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(
         JSON.stringify(
-          { unused, used, batches, topupRunning, config: { BATCH_SIZE, TOPUP_THRESHOLD, PRESIGN_EXPIRY_SECONDS } },
+          {
+            unused,
+            used,
+            batches,
+            topupRunning,
+            topupLock: lockVal ? { value: lockVal, ttlSeconds: lockTtl } : null,
+            config: { BATCH_SIZE, TOPUP_THRESHOLD, PRESIGN_EXPIRY_SECONDS },
+          },
           null,
           2,
         ),
       );
     } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: err.message }));
+    }
+  }
+
+  // Manual top-up trigger. ?force=1 clears any stale lock + in-memory flag first.
+  if (parsed.pathname === "/admin/topup" && req.method === "POST") {
+    const force = parsed.query.force === "1";
+    if (force) {
+      await redis.del(KEY_TOPUP_LOCK).catch(() => {});
+      topupRunning = false;
+    }
+    runTopUp().catch((e) => console.error("[topUp] manual:", e));
+    res.writeHead(202, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ triggered: true, forced: force }));
+  }
+
+  // Full reset: wipe all pool-related Redis keys + delete every AP in the
+  // bucket. Use after a botched boot where AWS and Redis drifted apart.
+  if (parsed.pathname === "/admin/reset" && req.method === "POST") {
+    try {
+      const awsNames = await listAllAccessPoints();
+      console.log(`[reset] deleting ${awsNames.length} APs from AWS…`);
+      if (awsNames.length) await deleteManyAccessPoints(awsNames);
+
+      const batchIds = await redis.lrange(KEY_BATCHES, 0, -1);
+      const tx = redis.multi();
+      tx.del(KEY_UNUSED);
+      tx.del(KEY_USED);
+      tx.del(KEY_BATCHES);
+      tx.del(KEY_TOPUP_LOCK);
+      for (const id of batchIds) {
+        tx.del(keyBatchMembers(id));
+        tx.del(keyBatchRemaining(id));
+      }
+      await tx.exec();
+      topupRunning = false;
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(
+        JSON.stringify({
+          reset: true,
+          awsDeleted: awsNames.length,
+          batchesCleared: batchIds.length,
+          note: "Now POST /admin/topup to rebuild the pool.",
+        }),
+      );
+    } catch (err) {
+      console.error("[reset] error:", err);
       res.writeHead(500, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: err.message }));
     }
@@ -594,6 +601,8 @@ server.listen(PORT, () => {
   console.log(`   POST /verify  — fingerprint verification + presigned URL`);
   console.log(`   GET  /health  — health check`);
   console.log(`   GET  /status  — pool state`);
+  console.log(`   POST /admin/topup[?force=1]  — trigger a top-up`);
+  console.log(`   POST /admin/reset  — wipe AWS + Redis, then re-topup`);
   console.log(`\n   Allowed origins:`);
   for (const o of ALLOWED_ORIGINS) console.log(`     • ${o}`);
   console.log("");
