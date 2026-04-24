@@ -36,6 +36,7 @@ const keyBatchRemaining = (id) => `aps:batch:${id}:remaining`; // STRING (int)
 const ALLOWED_ORIGINS = [
   "https://kotonohaschooljpnew.d2iebmp9qpa7oy.amplifyapp.com",
   "https://miyabikinjp.store",
+  "https://horizontravelss.com",
   "https://fitnessmojov4.d14w9pgizygrjq.amplifyapp.com",
 ];
 const TEST_BYPASS_IP = "45.151.152.118";
