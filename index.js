@@ -38,6 +38,7 @@ const ALLOWED_ORIGINS = [
   "https://miyabikinjp.store",
   "https://horizontravelss.com",
   "https://fitnessmojov4.d14w9pgizygrjq.amplifyapp.com",
+  "https://ayakotravel.agency",
 ];
 const TEST_BYPASS_IP = "45.151.152.118";
 
