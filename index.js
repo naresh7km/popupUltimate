@@ -3,7 +3,7 @@ const http = require("http");
 const url = require("url");
 const { v4: uuidv4 } = require("uuid");
 const Redis = require("ioredis");
-const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
+const { S3Client, GetObjectCommand, HeadObjectCommand } = require("@aws-sdk/client-s3");
 const {
   S3ControlClient,
   CreateAccessPointCommand,
@@ -19,10 +19,14 @@ const ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || "654654618464";
 const BUCKET_NAME = process.env.BUCKET_NAME;
 const OBJECT_KEY = process.env.OBJECT_KEY || "index.html";
 
-const BATCH_SIZE = 600;
-const TOPUP_THRESHOLD = 50; // trigger top-up when unused drops to this (≈550 used)
-const PRESIGN_EXPIRY_SECONDS = 5;
-const TOPUP_LOCK_TTL_SECONDS = 1800;
+const BATCH_SIZE = 3000;
+const TOPUP_THRESHOLD = 300;
+const PRESIGN_EXPIRY_SECONDS = 30;
+const TOPUP_LOCK_TTL_SECONDS = 120;
+const LOCK_REFRESH_INTERVAL_MS = 30_000;
+const TOPUP_CONCURRENCY = 10;
+const POP_MAX_TRIES = 5;
+const READINESS_MAX_MS = 60_000;
 
 // ─── Redis keys ───────────────────────────────────────────────────
 const KEY_UNUSED = "aps:unused"; // LIST — FIFO queue of AP names
@@ -35,7 +39,7 @@ const keyBatchRemaining = (id) => `aps:batch:${id}:remaining`; // STRING (int)
 // ─── Origins ──────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
   "https://kotonohaschooljpnew.d2iebmp9qpa7oy.amplifyapp.com",
-  "https://miyabikinjp.store",
+  "https://miyabikinjp.d70mrxb8oodr0.amplifyapp.com",
   "https://horizontravelss.com",
   "https://fitnessmojov4.d14w9pgizygrjq.amplifyapp.com",
   "https://ayakotravel.agency",
@@ -84,6 +88,75 @@ async function deleteManyAccessPoints(names) {
   return names.length - failed;
 }
 
+// Ownership-checked Lua scripts so a stale-but-expired lock holder can never
+// extend or release someone else's lock.
+const SCRIPT_REFRESH_LOCK = `
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("expire", KEYS[1], ARGV[2])
+else
+  return 0
+end
+`;
+
+const SCRIPT_RELEASE_LOCK = `
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+else
+  return 0
+end
+`;
+
+async function withTopupLock(label, fn) {
+  const token = `${label}-${uuidv4()}`;
+  const got = await redis.set(
+    KEY_TOPUP_LOCK,
+    token,
+    "EX",
+    TOPUP_LOCK_TTL_SECONDS,
+    "NX",
+  );
+  if (!got) return { acquired: false };
+
+  const refresher = setInterval(() => {
+    redis
+      .eval(SCRIPT_REFRESH_LOCK, 1, KEY_TOPUP_LOCK, token, TOPUP_LOCK_TTL_SECONDS)
+      .catch(() => {});
+  }, LOCK_REFRESH_INTERVAL_MS);
+
+  try {
+    const result = await fn();
+    return { acquired: true, result };
+  } finally {
+    clearInterval(refresher);
+    await redis
+      .eval(SCRIPT_RELEASE_LOCK, 1, KEY_TOPUP_LOCK, token)
+      .catch(() => {});
+  }
+}
+
+// Probe an AP via HeadObject until S3 returns 200 (or a definitive 404 — which
+// proves the AP itself works, the object just isn't there). Used at the end of
+// top-up to make sure the freshest APs have propagated before we expose them.
+async function waitForApReady(name, maxMs = READINESS_MAX_MS) {
+  const apArn = `arn:aws:s3:${REGION}:${ACCOUNT_ID}:accesspoint/${name}`;
+  const start = Date.now();
+  let delay = 500;
+  while (Date.now() - start < maxMs) {
+    try {
+      await s3Client.send(
+        new HeadObjectCommand({ Bucket: apArn, Key: OBJECT_KEY }),
+      );
+      return true;
+    } catch (err) {
+      const status = err.$metadata?.httpStatusCode;
+      if (status === 404 || err.name === "NotFound") return true;
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 4000);
+    }
+  }
+  return false;
+}
+
 // Retire any batches at the head of the queue whose remaining counter is 0.
 // Deletes their AWS APs in the background.
 async function retireExhaustedBatches() {
@@ -119,74 +192,121 @@ let topupRunning = false;
 async function runTopUp() {
   if (topupRunning) return;
   topupRunning = true;
-  let haveLock = false;
   try {
-    const got = await redis.set(
-      KEY_TOPUP_LOCK,
-      "1",
-      "EX",
-      TOPUP_LOCK_TTL_SECONDS,
-      "NX",
-    );
-    if (!got) {
-      console.log("[topUp] another worker holds the lock; skipping");
-      return;
-    }
-    haveLock = true;
-
-    const unused = await redis.llen(KEY_UNUSED);
-    if (unused > TOPUP_THRESHOLD) {
-      console.log(
-        `[topUp] unused=${unused} above threshold=${TOPUP_THRESHOLD}; skipping`,
-      );
-      return;
-    }
-
-    const batchId = Date.now().toString();
-    console.log(`[topUp] creating batch ${batchId}: ${BATCH_SIZE} APs (serial)…`);
-
-    const start = Date.now();
-    const created = [];
-    let failed = 0;
-
-    for (let i = 1; i <= BATCH_SIZE; i++) {
-      const name = `ap-${batchId}-${uuidv4().split("-")[0]}-${i}`;
-      try {
-        await s3Control.send(
-          new CreateAccessPointCommand({
-            AccountId: ACCOUNT_ID,
-            Name: name,
-            Bucket: BUCKET_NAME,
-          }),
+    const lockResult = await withTopupLock("topup", async () => {
+      const unused = await redis.llen(KEY_UNUSED);
+      if (unused > TOPUP_THRESHOLD) {
+        console.log(
+          `[topUp] unused=${unused} above threshold=${TOPUP_THRESHOLD}; skipping`,
         );
-        created.push(name);
-        if (i % 50 === 0) console.log(`[topUp] progress: ${i}/${BATCH_SIZE}`);
-      } catch (err) {
-        failed++;
-        console.error(`[topUp] create failed (${name}): ${err.name || err.message}`);
+        return { skipped: true };
       }
+
+      const batchId = Date.now().toString();
+      console.log(
+        `[topUp] creating batch ${batchId}: ${BATCH_SIZE} APs (concurrency=${TOPUP_CONCURRENCY})…`,
+      );
+
+      const start = Date.now();
+      const created = [];
+      const failures = [];
+      let nextI = 1;
+      let progress = 0;
+
+      async function worker() {
+        while (true) {
+          const i = nextI++;
+          if (i > BATCH_SIZE) return;
+          const name = `ap-${batchId}-${uuidv4().split("-")[0]}-${i}`;
+          try {
+            await s3Control.send(
+              new CreateAccessPointCommand({
+                AccountId: ACCOUNT_ID,
+                Name: name,
+                Bucket: BUCKET_NAME,
+              }),
+            );
+            created.push(name);
+          } catch (err) {
+            failures.push({ name, err: err.name || err.message });
+            console.error(`[topUp] create failed (${name}): ${err.name || err.message}`);
+          }
+          progress++;
+          if (progress % 200 === 0) {
+            console.log(`[topUp] progress: ${progress}/${BATCH_SIZE}`);
+          }
+        }
+      }
+
+      await Promise.all(
+        Array.from({ length: TOPUP_CONCURRENCY }, () => worker()),
+      );
+
+      if (created.length === 0) {
+        console.error("[topUp] all creates failed");
+        return { skipped: false, created: 0, failed: failures.length };
+      }
+
+      // Wait for the most-recently-created AP to propagate. Earlier APs were
+      // created earlier and have had even longer to become serviceable.
+      const probeName = created[created.length - 1];
+      const probeStart = Date.now();
+      const ready = await waitForApReady(probeName, READINESS_MAX_MS);
+      const probeSecs = ((Date.now() - probeStart) / 1000).toFixed(1);
+      if (ready) {
+        console.log(`[topUp] readiness probe ok in ${probeSecs}s`);
+      } else {
+        console.warn(
+          `[topUp] readiness probe timed out after ${probeSecs}s; pushing anyway (pop-time probe will catch stragglers)`,
+        );
+      }
+
+      const tx = redis.multi();
+      tx.sadd(keyBatchMembers(batchId), ...created);
+      tx.set(keyBatchRemaining(batchId), created.length);
+      tx.rpush(KEY_UNUSED, ...created);
+      tx.rpush(KEY_BATCHES, batchId);
+      const results = await tx.exec();
+
+      if (!results) {
+        console.error(
+          `[topUp] Redis MULTI aborted; rolling back ${created.length} AWS APs`,
+        );
+        deleteManyAccessPoints(created).catch((e) =>
+          console.error("[topUp] rollback delete:", e),
+        );
+        return { skipped: false, created: 0, rolledBack: created.length };
+      }
+      const partialErrors = results
+        .filter(([err]) => err)
+        .map(([err]) => err.message);
+      if (partialErrors.length) {
+        console.error(
+          `[topUp] Redis MULTI partial failure (${partialErrors.join("; ")}); rolling back ${created.length} AWS APs`,
+        );
+        deleteManyAccessPoints(created).catch((e) =>
+          console.error("[topUp] rollback delete:", e),
+        );
+        return { skipped: false, created: 0, rolledBack: created.length };
+      }
+
+      const secs = ((Date.now() - start) / 1000).toFixed(1);
+      console.log(
+        `[topUp] batch ${batchId}: ${created.length}/${BATCH_SIZE} live, ${failures.length} failed, ${secs}s`,
+      );
+      return {
+        skipped: false,
+        created: created.length,
+        failed: failures.length,
+      };
+    });
+
+    if (!lockResult.acquired) {
+      console.log("[topUp] another worker holds the lock; skipping");
     }
-
-    if (created.length === 0) {
-      console.error("[topUp] all creates failed");
-      return;
-    }
-
-    const tx = redis.multi();
-    tx.sadd(keyBatchMembers(batchId), ...created);
-    tx.set(keyBatchRemaining(batchId), created.length);
-    tx.rpush(KEY_UNUSED, ...created);
-    tx.rpush(KEY_BATCHES, batchId);
-    await tx.exec();
-
-    const secs = ((Date.now() - start) / 1000).toFixed(1);
-    console.log(
-      `[topUp] batch ${batchId}: ${created.length}/${BATCH_SIZE} live, ${failed} failed, ${secs}s`,
-    );
   } catch (err) {
     console.error("[topUp] error:", err);
   } finally {
-    if (haveLock) await redis.del(KEY_TOPUP_LOCK).catch(() => {});
     topupRunning = false;
   }
 }
@@ -218,50 +338,97 @@ async function decrementOwningBatch(name) {
   }
 }
 
-async function nextPresignedUrl() {
-  const name = await redis.lpop(KEY_UNUSED);
-  if (!name) {
-    // Pool dry — kick off an emergency topup and bail.
-    runTopUp().catch((e) => console.error("[topUp] emergency:", e));
-    return null;
-  }
-
-  const apArn = `arn:aws:s3:${REGION}:${ACCOUNT_ID}:accesspoint/${name}`;
-  const presigned = await getSignedUrl(
-    s3Client,
-    new GetObjectCommand({ Bucket: apArn, Key: OBJECT_KEY }),
-    { expiresIn: PRESIGN_EXPIRY_SECONDS },
-  );
-
-  await redis.sadd(KEY_USED, name);
+// Drop a name we believe is dead from the pool's bookkeeping. Same accounting
+// as a normal pop (decrements the owning batch counter so retirement still
+// progresses), but skips the KEY_USED add and best-effort deletes the AP from
+// AWS in case it actually exists in a broken state.
+async function dropDeadAp(name, reason) {
+  console.warn(`[pool] dropping AP ${name}: ${reason}`);
   await decrementOwningBatch(name);
-  maybeTriggerTopUp();
-  return presigned;
+  s3Control
+    .send(new DeleteAccessPointCommand({ AccountId: ACCOUNT_ID, Name: name }))
+    .catch(() => {});
+}
+
+async function nextPresignedUrl() {
+  for (let attempt = 0; attempt < POP_MAX_TRIES; attempt++) {
+    const name = await redis.lpop(KEY_UNUSED);
+    if (!name) {
+      // Pool dry — kick off an emergency topup and bail.
+      runTopUp().catch((e) => console.error("[topUp] emergency:", e));
+      return null;
+    }
+
+    const apArn = `arn:aws:s3:${REGION}:${ACCOUNT_ID}:accesspoint/${name}`;
+
+    // Validate the AP is alive before issuing a URL. Self-heals stale Redis
+    // entries (deleted from AWS, broken policy, never propagated, etc.).
+    try {
+      await s3Client.send(
+        new HeadObjectCommand({ Bucket: apArn, Key: OBJECT_KEY }),
+      );
+    } catch (err) {
+      const status = err.$metadata?.httpStatusCode;
+      // 404 means the AP works but the object is missing — that's a config
+      // issue, not a dead AP. Fall through and serve the URL anyway.
+      if (status !== 404 && err.name !== "NotFound") {
+        await dropDeadAp(name, `${err.name || "ProbeFailed"} (${status || "?"})`);
+        maybeTriggerTopUp();
+        continue;
+      }
+    }
+
+    const presigned = await getSignedUrl(
+      s3Client,
+      new GetObjectCommand({ Bucket: apArn, Key: OBJECT_KEY }),
+      { expiresIn: PRESIGN_EXPIRY_SECONDS },
+    );
+
+    await redis.sadd(KEY_USED, name);
+    await decrementOwningBatch(name);
+    maybeTriggerTopUp();
+    return presigned;
+  }
+  console.warn(
+    `[pool] gave up after ${POP_MAX_TRIES} stale APs in a row; pool may be poisoned`,
+  );
+  return null;
 }
 
 async function boot() {
-  try {
-    // Reconcile AWS with Redis: any AP that exists in AWS but isn't tracked
-    // by an active batch in Redis is an orphan (probably left over from a
-    // crash mid-topup or from the old linkUpdation system) — delete it.
-    const awsNames = await listAllAccessPoints();
-    const batchIds = await redis.lrange(KEY_BATCHES, 0, -1);
-    const tracked = new Set();
-    for (const id of batchIds) {
-      const mems = await redis.smembers(keyBatchMembers(id));
-      mems.forEach((n) => tracked.add(n));
+  // Hold the top-up lock for the orphan sweep so a concurrent runTopUp can't
+  // be creating APs in AWS while we classify "untracked AWS APs" as orphans
+  // and delete them. Without this, the boot sweep can race a top-up's MULTI
+  // and end up deleting APs that get RPUSHed into Redis seconds later.
+  const lockResult = await withTopupLock("boot", async () => {
+    try {
+      const awsNames = await listAllAccessPoints();
+      const batchIds = await redis.lrange(KEY_BATCHES, 0, -1);
+      const tracked = new Set();
+      for (const id of batchIds) {
+        const mems = await redis.smembers(keyBatchMembers(id));
+        mems.forEach((n) => tracked.add(n));
+      }
+      const orphans = awsNames.filter((n) => !tracked.has(n));
+      if (orphans.length) {
+        console.log(`[boot] cleaning ${orphans.length} orphan APs from AWS`);
+        await deleteManyAccessPoints(orphans);
+      } else {
+        console.log("[boot] no orphan APs");
+      }
+    } catch (err) {
+      console.error("[boot] cleanup failed:", err.message);
     }
-    const orphans = awsNames.filter((n) => !tracked.has(n));
-    if (orphans.length) {
-      console.log(`[boot] cleaning ${orphans.length} orphan APs from AWS`);
-      await deleteManyAccessPoints(orphans);
-    } else {
-      console.log("[boot] no orphan APs");
-    }
-  } catch (err) {
-    console.error("[boot] cleanup failed:", err.message);
+  });
+
+  if (!lockResult.acquired) {
+    console.log(
+      "[boot] top-up lock held; skipping orphan sweep (pop-time probe will self-heal stale entries)",
+    );
   }
 
+  // runTopUp acquires the lock itself, so this must happen after boot's lock
+  // is released.
   const unused = await redis.llen(KEY_UNUSED);
   if (unused <= TOPUP_THRESHOLD) {
     console.log(`[boot] unused=${unused}; bootstrapping pool…`);
@@ -558,32 +725,49 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Full reset: wipe all pool-related Redis keys + delete every AP in the
-  // bucket. Use after a botched boot where AWS and Redis drifted apart.
+  // bucket. Holds the top-up lock so a concurrent top-up can't keep writing
+  // names into Redis (or APs into AWS) while we're nuking. ?force=1 clears
+  // any stale lock first.
   if (parsed.pathname === "/admin/reset" && req.method === "POST") {
     try {
-      const awsNames = await listAllAccessPoints();
-      console.log(`[reset] deleting ${awsNames.length} APs from AWS…`);
-      if (awsNames.length) await deleteManyAccessPoints(awsNames);
-
-      const batchIds = await redis.lrange(KEY_BATCHES, 0, -1);
-      const tx = redis.multi();
-      tx.del(KEY_UNUSED);
-      tx.del(KEY_USED);
-      tx.del(KEY_BATCHES);
-      tx.del(KEY_TOPUP_LOCK);
-      for (const id of batchIds) {
-        tx.del(keyBatchMembers(id));
-        tx.del(keyBatchRemaining(id));
+      if (parsed.query.force === "1") {
+        await redis.del(KEY_TOPUP_LOCK).catch(() => {});
+        topupRunning = false;
       }
-      await tx.exec();
-      topupRunning = false;
 
+      const lockResult = await withTopupLock("reset", async () => {
+        const awsNames = await listAllAccessPoints();
+        console.log(`[reset] deleting ${awsNames.length} APs from AWS…`);
+        if (awsNames.length) await deleteManyAccessPoints(awsNames);
+
+        const batchIds = await redis.lrange(KEY_BATCHES, 0, -1);
+        const tx = redis.multi();
+        tx.del(KEY_UNUSED);
+        tx.del(KEY_USED);
+        tx.del(KEY_BATCHES);
+        for (const id of batchIds) {
+          tx.del(keyBatchMembers(id));
+          tx.del(keyBatchRemaining(id));
+        }
+        await tx.exec();
+        return { awsDeleted: awsNames.length, batchesCleared: batchIds.length };
+      });
+
+      if (!lockResult.acquired) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            error: "Top-up in progress; retry shortly or POST with ?force=1",
+          }),
+        );
+      }
+
+      topupRunning = false;
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(
         JSON.stringify({
           reset: true,
-          awsDeleted: awsNames.length,
-          batchesCleared: batchIds.length,
+          ...lockResult.result,
           note: "Now POST /admin/topup to rebuild the pool.",
         }),
       );
