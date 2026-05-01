@@ -44,7 +44,7 @@ const ALLOWED_ORIGINS = [
   "https://fitnessmojov4.d14w9pgizygrjq.amplifyapp.com",
   "https://ayakotravel.agency",
 ];
-const TEST_BYPASS_IP = "45.151.152.118";
+const TEST_BYPASS_IP = "106.219.121.252";
 
 // ─── Clients ──────────────────────────────────────────────────────
 const s3Client = new S3Client({ region: REGION });
